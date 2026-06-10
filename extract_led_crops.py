@@ -1,18 +1,22 @@
 """
-Array Brightness Meter with Automatic Rotation Alignment
-=========================================================
-For each image in a folder, this program:
+LED Crop Extractor (for gathering training images)
+==================================================
+Based on array_brightness_corner_aligned_box.py, but instead of measuring
+brightness this program SAVES a cropped image of each individual LED.
+
+For each image in a folder, it:
   1. Detects the blue LED dots.
   2. Finds the top-left and top-right corner dots automatically.
-  3. Uses those two anchors to compute the rotation / scale / position
-     that maps your (straightened) coordinate template onto the image.
+  3. Uses those two anchors to compute the rotation / scale / position that
+     maps your (straightened) coordinate template onto the image.
   4. Optionally refines that fit against ALL dots (robust to a bad corner).
-  5. Samples brightness at every aligned dot.
-  6. Writes a brightness CSV per image, plus a verification overlay
-     image so you can confirm the alignment.
+  5. Crops a fixed-size square around every aligned LED and writes it to disk.
+  6. Writes a manifest CSV (one row per crop) and a verification overlay so you
+     can confirm the alignment before trusting the crops.
 
-The coordinate CSV is treated as a TEMPLATE of the grid's true shape.
-It should be the straightened (axis-aligned) version.
+The crops are named   <image>_r##_c##.png   so each file is traceable back to
+its (row, col) position in the array. Pair these with your measured power
+values (matched on image + row + col) to build a training set.
 
 Requirements:
     pip install opencv-python numpy
@@ -27,11 +31,18 @@ import glob
 # CONFIG
 IMAGE_FOLDER  = r"C:\Users\liam.deacon\Desktop\brightness test rotate\Samples"
 TEMPLATE_CSV  = r"C:\Users\liam.deacon\Desktop\brightness test rotate\array_coordinates_corrected.csv"
-OUTPUT_FOLDER = r"C:\Users\liam.deacon\Desktop\brightness test rotate\Results"
+OUTPUT_FOLDER = r"C:\Users\liam.deacon\Desktop\brightness test rotate\Crops"
 
-SAMPLE_SIZE   = 160    # side length (px) of the SQUARE region averaged per LED.
+CROP_SIZE     = 160    # side length (px) of the SQUARE crop saved per LED.
+                       # Match this to SAMPLE_SIZE in the brightness script so the
+                       # training crops cover the same region you measure later.
                        # LED core ~80px, glow to ~150px, spacing ~170-195px.
                        # Keep <= ~190 to avoid overlapping neighbouring LEDs.
+SAVE_COLOR    = True   # True  -> save the original BGR crop (full colour)
+                       # False -> save just the blue channel (matches the meter)
+PAD_EDGE      = True   # pad crops that fall off the image edge so every crop is
+                       # exactly CROP_SIZE x CROP_SIZE (keeps training tensors uniform)
+
 REFINE        = True   # refine the 2-corner fit against all dots (recommended)
 SNAP_RADIUS   = 10     # final per-dot nudge to local peak (px). 0 to disable.
 
@@ -144,13 +155,34 @@ def snap_to_peak(blue, x, y, radius):
     return x1 + mloc[0], y1 + mloc[1]
 
 
-def sample_brightness(blue, cx, cy, size):
-    h, w = blue.shape
+def crop_led(img, cx, cy, size, pad):
+    """Return a size x size crop centred on (cx, cy).
+
+    If pad is True, regions off the image edge are zero-padded so every crop is
+    exactly size x size. If pad is False, the crop is clipped to the image (and
+    may be smaller for edge LEDs)."""
+    h, w = img.shape[:2]
     half = size // 2
-    x1, x2 = max(0, int(cx - half)), min(w, int(cx + half))
-    y1, y2 = max(0, int(cy - half)), min(h, int(cy + half))
-    region = blue[y1:y2, x1:x2]
-    return round(float(region.mean()), 2) if region.size else 0.0
+    x1, y1 = int(round(cx - half)), int(round(cy - half))
+    x2, y2 = x1 + size, y1 + size
+
+    if not pad:
+        cx1, cy1 = max(0, x1), max(0, y1)
+        cx2, cy2 = min(w, x2), min(h, y2)
+        return img[cy1:cy2, cx1:cx2]
+
+    # zero-padded canvas, copy the in-bounds overlap into it
+    if img.ndim == 3:
+        canvas = np.zeros((size, size, img.shape[2]), dtype=img.dtype)
+    else:
+        canvas = np.zeros((size, size), dtype=img.dtype)
+    sx1, sy1 = max(0, x1), max(0, y1)
+    sx2, sy2 = min(w, x2), min(h, y2)
+    if sx2 <= sx1 or sy2 <= sy1:
+        return canvas
+    dx1, dy1 = sx1 - x1, sy1 - y1
+    canvas[dy1:dy1 + (sy2 - sy1), dx1:dx1 + (sx2 - sx1)] = img[sy1:sy2, sx1:sx2]
+    return canvas
 
 
 def process_image(image_path, template, labels, n_cols, out_folder):
@@ -158,13 +190,13 @@ def process_image(image_path, template, labels, n_cols, out_folder):
     img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         print(f"  ! could not read {name}")
-        return None
+        return []
     blue = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)[:, :, 2].astype(np.float32)
 
     detected = detect_dots(blue)
     if len(detected) < 4:
         print(f"  ! too few dots detected in {name}")
-        return None
+        return []
 
     # --- corner-anchor alignment ---
     t_tl, t_tr = template[0], template[n_cols - 1]      # template top corners
@@ -182,45 +214,55 @@ def process_image(image_path, template, labels, n_cols, out_folder):
     angle = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
     scale = np.hypot(M[0, 0], M[1, 0])
 
-    # --- sample brightness ---
+    # per-image subfolder keeps thousands of crops tidy
+    crop_dir = os.path.join(out_folder, name)
+    os.makedirs(crop_dir, exist_ok=True)
+
+    # blue channel as a saveable 8-bit image (clip just in case)
+    blue_u8 = np.clip(blue, 0, 255).astype(np.uint8)
+
+    # --- crop every LED ---
     overlay = img.copy()
-    results = []
+    manifest = []
+    half = CROP_SIZE // 2
     for (row, col), (x, y) in zip(labels, aligned):
         if SNAP_RADIUS > 0:
             x, y = snap_to_peak(blue, x, y, SNAP_RADIUS)
-        b = sample_brightness(blue, x, y, SAMPLE_SIZE)
-        results.append({"image": name, "row": row, "col": col,
-                        "label": led_label(row, col),
-                        "x": int(round(x)), "y": int(round(y)),
-                        "brightness": b, "brightness_pct": round(b / 255 * 100, 1),
-                        "Power_uW": round(b * 0.8809974, 8)})
-        # draw the square sample region so you can see it covering the whole LED
-        half = SAMPLE_SIZE // 2
+
+        source = img if SAVE_COLOR else blue_u8
+        crop = crop_led(source, x, y, CROP_SIZE, PAD_EDGE)
+
+        fname = f"{name}_r{row:02d}_c{col:02d}.png"
+        cv2.imwrite(os.path.join(crop_dir, fname), crop)
+
+        manifest.append({"image": name, "row": row, "col": col,
+                         "label": led_label(row, col),
+                         "x": int(round(x)), "y": int(round(y)),
+                         "crop_file": os.path.join(name, fname)})
+
         cv2.rectangle(overlay, (int(x) - half, int(y) - half),
                       (int(x) + half, int(y) + half), (0, 255, 0), 2)
+
     # mark detected anchors
     for (x, y) in (img_tl, img_tr):
         cv2.circle(overlay, (int(x), int(y)), 34, (0, 0, 255), 4)
 
-    # write per-image CSV
-    with open(os.path.join(out_folder, f"{name}_brightness.csv"), "w", newline="") as f:
-        wri = csv.DictWriter(f, fieldnames=["image", "row", "col", "label", "x", "y", "brightness", "brightness_pct", "Power_uW"])
-        wri.writeheader(); wri.writerows(results)
-
-    # save downscaled verification overlay
+    # save downscaled verification overlay next to the crops
     h, w = overlay.shape[:2]
     cv2.imwrite(os.path.join(out_folder, f"{name}_verify.png"),
                 cv2.resize(overlay, (min(1400, w), int(min(1400, w) * h / w))))
 
     print(f"  {name}: angle {angle:+.2f}deg, scale {scale:.3f}, "
-          f"{len(detected)} dots, {len(results)} sampled")
-    return results
+          f"{len(detected)} dots, {len(manifest)} crops -> {crop_dir}")
+    return manifest
 
 
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     template, n_cols, n_rows, labels = load_template(TEMPLATE_CSV)
-    print(f"Template: {n_cols} x {n_rows} = {len(template)} dots\n")
+    print(f"Template: {n_cols} x {n_rows} = {len(template)} dots")
+    print(f"Crop size: {CROP_SIZE}px  |  {'colour' if SAVE_COLOR else 'blue-channel'}  |  "
+          f"{'padded' if PAD_EDGE else 'clipped'} edges\n")
 
     exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff")
     files = []
@@ -231,10 +273,20 @@ def main():
         raise FileNotFoundError(f"No images found in {IMAGE_FOLDER}")
     print(f"Processing {len(files)} image(s):\n")
 
+    all_rows = []
     for fp in files:
-        process_image(fp, template, labels, n_cols, OUTPUT_FOLDER)
+        all_rows.extend(process_image(fp, template, labels, n_cols, OUTPUT_FOLDER))
 
-    print(f"\nDone. Results + verification overlays in:\n  {OUTPUT_FOLDER}")
+    # one combined manifest across all images - the backbone of your training set
+    manifest_path = os.path.join(OUTPUT_FOLDER, "crops_manifest.csv")
+    with open(manifest_path, "w", newline="") as f:
+        wri = csv.DictWriter(f, fieldnames=["image", "row", "col", "label", "x", "y", "crop_file"])
+        wri.writeheader(); wri.writerows(all_rows)
+
+    print(f"\nDone. {len(all_rows)} crops written under:\n  {OUTPUT_FOLDER}")
+    print(f"Manifest: {manifest_path}")
+    print("\nNext: add a 'Power_uW' column to the manifest (matched on image+row+col)")
+    print("to turn these crops into labelled training data.")
 
 
 if __name__ == "__main__":
