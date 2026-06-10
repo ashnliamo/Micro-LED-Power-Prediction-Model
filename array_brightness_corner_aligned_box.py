@@ -1,0 +1,221 @@
+"""
+Array Brightness Meter with Automatic Rotation Alignment
+=========================================================
+For each image in a folder, this program:
+  1. Detects the blue LED dots.
+  2. Finds the top-left and top-right corner dots automatically.
+  3. Uses those two anchors to compute the rotation / scale / position
+     that maps your (straightened) coordinate template onto the image.
+  4. Optionally refines that fit against ALL dots (robust to a bad corner).
+  5. Samples brightness at every aligned dot.
+  6. Writes a brightness CSV per image, plus a verification overlay
+     image so you can confirm the alignment.
+
+The coordinate CSV is treated as a TEMPLATE of the grid's true shape.
+It should be the straightened (axis-aligned) version.
+
+Requirements:
+    pip install opencv-python numpy
+"""
+
+import cv2
+import numpy as np
+import csv
+import os
+import glob
+
+# CONFIG
+IMAGE_FOLDER  = r"C:\Users\liam.deacon\Desktop\brightness test rotate\Samples"
+TEMPLATE_CSV  = r"C:\Users\liam.deacon\Desktop\brightness test rotate\array_coordinates_corrected.csv"
+OUTPUT_FOLDER = r"C:\Users\liam.deacon\Desktop\brightness test rotate\Results"
+
+SAMPLE_SIZE   = 160    # side length (px) of the SQUARE region averaged per LED.
+                       # LED core ~80px, glow to ~150px, spacing ~170-195px.
+                       # Keep <= ~190 to avoid overlapping neighbouring LEDs.
+REFINE        = True   # refine the 2-corner fit against all dots (recommended)
+SNAP_RADIUS   = 10     # final per-dot nudge to local peak (px). 0 to disable.
+
+# Dot detection tuning
+THRESH_FRAC   = 0.35   # brightness threshold as fraction of image max (lower = more sensitive)
+MIN_AREA      = 40     # ignore blobs smaller than this (px) - filters noise
+
+
+def load_template(path):
+    """Read coordinate CSV -> (points Nx2, n_cols, n_rows, labels[(row,col)...])."""
+    with open(path, newline="") as f:
+        reader = csv.reader(f)
+        header = next(reader)
+        rows = list(reader)
+    n_cols = len(header) // 2
+    pts, labels = [], []
+    for r_idx, row in enumerate(rows):
+        for c_idx in range(n_cols):
+            pts.append([float(row[c_idx * 2]), float(row[c_idx * 2 + 1])])
+            labels.append((r_idx + 1, c_idx + 1))
+    return np.array(pts, np.float32), n_cols, len(rows), labels
+
+
+def detect_dots(blue):
+    """Return centroids (Nx2) of bright blobs in the blue channel."""
+    mx = float(blue.max())
+    _, mask = cv2.threshold(blue.astype(np.uint8), int(mx * THRESH_FRAC), 255, cv2.THRESH_BINARY)
+    mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, np.ones((5, 5), np.uint8))
+    contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    centers = []
+    for cnt in contours:
+        if cv2.contourArea(cnt) < MIN_AREA:
+            continue
+        M = cv2.moments(cnt)
+        if M["m00"]:
+            centers.append([M["m10"] / M["m00"], M["m01"] / M["m00"]])
+    return np.array(centers, np.float32)
+
+
+def find_top_corners(detected):
+    """Top-left = min(x+y); top-right = max(x-y). Works for moderate rotation."""
+    tl = detected[np.argmin(detected[:, 0] + detected[:, 1])]
+    tr = detected[np.argmax(detected[:, 0] - detected[:, 1])]
+    return tl, tr
+
+
+def similarity_from_2pts(src, dst):
+    """Similarity transform (rotation+scale+translation) mapping src pair -> dst pair."""
+    (ax, ay), (bx, by) = src
+    (Ax, Ay), (Bx, By) = dst
+    vx, vy = bx - ax, by - ay
+    Vx, Vy = Bx - Ax, By - Ay
+    s = np.hypot(Vx, Vy) / np.hypot(vx, vy)
+    ang = np.arctan2(Vy, Vx) - np.arctan2(vy, vx)
+    c, sn = s * np.cos(ang), s * np.sin(ang)
+    R = np.array([[c, -sn], [sn, c]])
+    t = np.array([Ax, Ay]) - R @ np.array([ax, ay])
+    M = np.zeros((2, 3), np.float32)
+    M[:, :2] = R
+    M[:, 2] = t
+    return M
+
+
+def refine_against_all(template, aligned_pts, detected, gate=40):
+    """One robust pass: match aligned template pts to nearest dots, re-fit with RANSAC."""
+    src, dst = [], []
+    for k, p in enumerate(aligned_pts):
+        d2 = ((detected - p) ** 2).sum(axis=1)
+        j = int(np.argmin(d2))
+        if d2[j] <= gate * gate:
+            src.append(template[k])
+            dst.append(detected[j])
+    if len(src) < 12:
+        return None
+    M, _ = cv2.estimateAffinePartial2D(
+        np.array(src, np.float32), np.array(dst, np.float32),
+        method=cv2.RANSAC, ransacReprojThreshold=6,
+    )
+    return M
+
+
+def snap_to_peak(blue, x, y, radius):
+    h, w = blue.shape
+    x1, x2 = max(0, int(x - radius)), min(w, int(x + radius))
+    y1, y2 = max(0, int(y - radius)), min(h, int(y + radius))
+    region = blue[y1:y2, x1:x2]
+    if region.size == 0:
+        return x, y
+    blurred = cv2.GaussianBlur(region, (7, 7), 0)
+    _, _, _, mloc = cv2.minMaxLoc(blurred)
+    return x1 + mloc[0], y1 + mloc[1]
+
+
+def sample_brightness(blue, cx, cy, size):
+    h, w = blue.shape
+    half = size // 2
+    x1, x2 = max(0, int(cx - half)), min(w, int(cx + half))
+    y1, y2 = max(0, int(cy - half)), min(h, int(cy + half))
+    region = blue[y1:y2, x1:x2]
+    return round(float(region.mean()), 2) if region.size else 0.0
+
+
+def process_image(image_path, template, labels, n_cols, out_folder):
+    name = os.path.splitext(os.path.basename(image_path))[0]
+    img = cv2.imdecode(np.fromfile(image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
+    if img is None:
+        print(f"  ! could not read {name}")
+        return None
+    blue = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)[:, :, 2].astype(np.float32)
+
+    detected = detect_dots(blue)
+    if len(detected) < 4:
+        print(f"  ! too few dots detected in {name}")
+        return None
+
+    # --- corner-anchor alignment ---
+    t_tl, t_tr = template[0], template[n_cols - 1]      # template top corners
+    img_tl, img_tr = find_top_corners(detected)         # image top corners
+    M = similarity_from_2pts([t_tl, t_tr], [img_tl, img_tr])
+    aligned = cv2.transform(template.reshape(-1, 1, 2), M).reshape(-1, 2)
+
+    # --- optional all-points refinement ---
+    if REFINE:
+        M2 = refine_against_all(template, aligned, detected)
+        if M2 is not None:
+            M = M2
+            aligned = cv2.transform(template.reshape(-1, 1, 2), M).reshape(-1, 2)
+
+    angle = np.degrees(np.arctan2(M[1, 0], M[0, 0]))
+    scale = np.hypot(M[0, 0], M[1, 0])
+
+    # --- sample brightness ---
+    overlay = img.copy()
+    results = []
+    for (row, col), (x, y) in zip(labels, aligned):
+        if SNAP_RADIUS > 0:
+            x, y = snap_to_peak(blue, x, y, SNAP_RADIUS)
+        b = sample_brightness(blue, x, y, SAMPLE_SIZE)
+        results.append({"image": name, "row": row, "col": col,
+                        "x": int(round(x)), "y": int(round(y)),
+                        "brightness": b, "brightness_pct": round(b / 255 * 100, 1),
+                        "Power_uW": round(b * 0.8809974, 8)})
+        # draw the square sample region so you can see it covering the whole LED
+        half = SAMPLE_SIZE // 2
+        cv2.rectangle(overlay, (int(x) - half, int(y) - half),
+                      (int(x) + half, int(y) + half), (0, 255, 0), 2)
+    # mark detected anchors
+    for (x, y) in (img_tl, img_tr):
+        cv2.circle(overlay, (int(x), int(y)), 34, (0, 0, 255), 4)
+
+    # write per-image CSV
+    with open(os.path.join(out_folder, f"{name}_brightness.csv"), "w", newline="") as f:
+        wri = csv.DictWriter(f, fieldnames=["image", "row", "col", "x", "y", "brightness", "brightness_pct", "Power_uW"])
+        wri.writeheader(); wri.writerows(results)
+
+    # save downscaled verification overlay
+    h, w = overlay.shape[:2]
+    cv2.imwrite(os.path.join(out_folder, f"{name}_verify.png"),
+                cv2.resize(overlay, (min(1400, w), int(min(1400, w) * h / w))))
+
+    print(f"  {name}: angle {angle:+.2f}deg, scale {scale:.3f}, "
+          f"{len(detected)} dots, {len(results)} sampled")
+    return results
+
+
+def main():
+    os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+    template, n_cols, n_rows, labels = load_template(TEMPLATE_CSV)
+    print(f"Template: {n_cols} x {n_rows} = {len(template)} dots\n")
+
+    exts = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff")
+    files = []
+    for e in exts:
+        files.extend(glob.glob(os.path.join(IMAGE_FOLDER, e)))
+    files.sort()
+    if not files:
+        raise FileNotFoundError(f"No images found in {IMAGE_FOLDER}")
+    print(f"Processing {len(files)} image(s):\n")
+
+    for fp in files:
+        process_image(fp, template, labels, n_cols, OUTPUT_FOLDER)
+
+    print(f"\nDone. Results + verification overlays in:\n  {OUTPUT_FOLDER}")
+
+
+if __name__ == "__main__":
+    main()
