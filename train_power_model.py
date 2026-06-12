@@ -26,12 +26,19 @@ Outputs land in  Model/ :
     residuals_by_power.png          residual vs measured power
     feature_importance.png          model coefficients / importances
 
+This script also runs the crop-extraction step first: it rebuilds the labelled
+crops in Training Crops/ from the raw arrays in Training data/ (image + LIV
+spreadsheet), then trains on them. Pass --no-extract to skip that and train on
+whatever crops already exist.
+
 Usage:
-    py train_power_model.py            # Ridge (default)
-    py train_power_model.py rf         # RandomForest instead
+    py train_power_model.py                 # extract crops + train RandomForest (default)
+    py train_power_model.py ridge           # use Ridge instead of RandomForest
+    py train_power_model.py --no-extract     # skip extraction, train on existing crops
+    py train_power_model.py rf --no-extract  # combine flags in any order
 
 Requirements:
-    pip install opencv-python numpy scikit-learn matplotlib joblib
+    pip install opencv-python numpy scikit-learn matplotlib joblib openpyxl
 """
 
 import os
@@ -47,13 +54,18 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import KFold, LeaveOneGroupOut, cross_val_predict
 
 from power_model import PowerModel, extract_features, features_from_file, FEATURE_NAMES
+import extract_training_crops as E
 from extract_training_crops import pad_label
 
 # CONFIG
 BASE          = r"C:\Users\liam.deacon\Desktop\brightness test rotate"
 CROPS_ROOT    = os.path.join(BASE, "Training Crops")
 OUTPUT_FOLDER = os.path.join(BASE, "Model")
-MODEL_KIND    = sys.argv[1] if len(sys.argv) > 1 else "rf"   # "ridge" or "rf"
+
+# Args (order-independent): a model kind ("ridge"/"rf") and an optional --no-extract flag
+_args         = [a.lower() for a in sys.argv[1:]]
+MODEL_KIND    = next((a for a in _args if a in ("ridge", "rf")), "rf")
+SKIP_EXTRACT  = any(a in ("--no-extract", "--skip-extract") for a in _args)
 
 
 # --------------------------------------------------------------------------- #
@@ -158,8 +170,33 @@ def cv_predict_scalar(x, y, splitter, groups=None):
 # --------------------------------------------------------------------------- #
 #  Main                                                                        #
 # --------------------------------------------------------------------------- #
+def _extract_crops():
+    """Rebuild Training Crops/ from Training data/ (image + LIV sheet per array).
+
+    Non-fatal: if there's no Training data/ to extract from, we just train on
+    whatever crops already exist."""
+    print("=" * 68)
+    print(f"STEP 1/2  Extracting labelled crops from {E.TRAINING_DIR}")
+    print("=" * 68)
+    try:
+        E.main()
+    except FileNotFoundError as exc:
+        print(f"  (no raw arrays to extract - {exc})")
+        print("  -> training on existing Training Crops/ instead")
+    print()
+
+
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
+
+    if SKIP_EXTRACT:
+        print("(--no-extract: skipping crop extraction, using existing Training Crops/)\n")
+    else:
+        _extract_crops()
+
+    print("=" * 68)
+    print(f"STEP 2/2  Training power model ({MODEL_KIND})")
+    print("=" * 68)
     X, y, groups, meta = load_dataset()
     n, f = X.shape
     arrays = sorted(set(groups))

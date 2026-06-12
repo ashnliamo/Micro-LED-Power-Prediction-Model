@@ -2,10 +2,13 @@ __pycache__/
 *.pyc
 
 # Generated / transient artifacts
-Model/                 # trained model, metrics, plots (regenerate with train_power_model.py)
-Input/                 # local prediction inputs
-Output/                # local prediction outputs
-memory/                # agent memory
+# (Model/ = trained model, metrics, plots; regenerate with train_power_model.py)
+Model/
+# local prediction inputs/outputs
+Input/
+Output/
+# agent memory
+memory/
 
 # Debug / scratch
 _left42.png
