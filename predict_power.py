@@ -1,33 +1,8 @@
-"""
-Predict LED Power from an Array Image
-=====================================
-Drop a FOLDER in Input/ (like the training-data folders) containing:
-     <the array image>            e.g. Analysis_image-Stitched_-9.png
-     a measured CSV or .xlsx      the 40 (or however many) LEDs you measured
--> CALIBRATED prediction. The measured LEDs are used as anchors to remove that
-   array's exposure offset, so the unmeasured LEDs are predicted on the correct
-   absolute scale. You also get an honest "blind" accuracy report (how the raw
-   model did on the measured LEDs before calibration).
+"""Predict per-LED power for each array folder in Input/.
 
-The measured file can be either:
-   * a CSV with a label column (label / Channel) and a Power_uW column
-     (the same columns as Training Crops/<array>/labels.csv works too), or
-   * the array's .xlsx workbook (its LIV sheet is read at
-     I_Low=0.75 mA / VDD_50LED=4.5 V, exactly like the training pipeline).
-
-A folder with no measured file is skipped (measurements are required so the
-prediction can be calibrated to that array's exposure).
-
-For every input it writes a CSV + labelled overlay to the Output folder.
-
-Train the model first if it doesn't exist yet:
-    py train_power_model.py           # extracts crops + fits + saves Model/power_model.joblib
-
-Usage:
-    py predict_power.py               # processes every image/folder in Input/
-
-Requirements:
-    pip install opencv-python numpy scikit-learn joblib openpyxl
+Each folder needs the array image + a measured CSV/xlsx; the measured LEDs anchor
+a per-array linear calibration of the model's predictions. Output CSV + overlay
+land in Output/. Train first with: py train_power_model.py
 """
 
 import os
@@ -36,35 +11,27 @@ import glob
 import numpy as np
 import cv2
 
-import extract_training_crops as E          # reuse the alignment pipeline
+import extract_training_crops as E
 from power_model import PowerModel, extract_features, FEATURE_NAMES
 
-_INT_I = FEATURE_NAMES.index("integrated")  # feature indices used by the dark gate
+_INT_I = FEATURE_NAMES.index("integrated")
 _PEAK_I = FEATURE_NAMES.index("peak")
 
-# CONFIG
-BASE          = os.path.dirname(os.path.abspath(__file__))   # portable: this script's folder
+BASE          = os.path.dirname(os.path.abspath(__file__))
 INPUT_FOLDER  = os.path.join(BASE, "Input")
 OUTPUT_FOLDER = os.path.join(BASE, "Output")
 MODEL_PATH    = os.path.join(BASE, "Model", "power_model.joblib")
-SAVE_OVERLAY  = True                         # also write a labelled verification image
-MIN_CALIB_PTS = 3                            # need this many measured LEDs to calibrate
+SAVE_OVERLAY  = True
+MIN_CALIB_PTS = 3
 
-# Dark/"off" LED gate: a crop with essentially no light is forced to 0 uW, instead
-# of letting the model (which can't output 0) and calibration invent power for it.
-# Lit LEDs have integrated > 350k / peak > 60 even at ~2 uW; dead ones sit near 3k / 4,
-# so this threshold sits safely in the wide gap between them.
-DARK_INTEGRATED = 50000.0                    # integrated signal below this => LED is off
-DARK_PEAK       = 30.0                        # ...and peak below this => off
+# An unlit LED has near-zero signal; force it to 0 uW instead of the model's floor.
+DARK_INTEGRATED = 50000.0
+DARK_PEAK       = 30.0
 
 IMG_EXTS = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff")
 
 
-# --------------------------------------------------------------------------- #
-#  Metrics + calibration helpers                                              #
-# --------------------------------------------------------------------------- #
 def _metrics(meas, pred):
-    """MAE, RMSE, R2 between measured and predicted arrays."""
     err = pred - meas
     mae = float(np.mean(np.abs(err)))
     rmse = float(np.sqrt(np.mean(err ** 2)))
@@ -75,10 +42,7 @@ def _metrics(meas, pred):
 
 
 def _fit_calibration(raw, meas):
-    """Fit  meas ~ a*raw + b  on the measured anchors. Returns (a, b).
-
-    Falls back to identity (1, 0) if there aren't enough points or the raw
-    predictions have no spread (can't fit a line)."""
+    """meas ~ a*raw + b; identity (1, 0) if too few points or no spread."""
     raw = np.asarray(raw, np.float64)
     meas = np.asarray(meas, np.float64)
     if len(raw) < MIN_CALIB_PTS or raw.std() < 1e-6:
@@ -87,14 +51,8 @@ def _fit_calibration(raw, meas):
     return float(a), float(b)
 
 
-# --------------------------------------------------------------------------- #
-#  Reading the measured-LED file (CSV or xlsx)                                 #
-# --------------------------------------------------------------------------- #
 def _read_measured_csv(path):
-    """Return {(letter, number): power_uW} from a CSV with a label + power column.
-
-    Tolerant about column names: label may be 'label'/'Label'/'Channel'/'channel';
-    power may be 'Power_uW'/'power_uW'/'power'/'Power'."""
+    """{(letter, number): power_uW} from a CSV with a label + power column."""
     out = {}
     with open(path, newline="") as f:
         reader = csv.DictReader(f)
@@ -118,11 +76,8 @@ def _read_measured_csv(path):
 
 
 def _find_measured(folder):
-    """Look in a folder for a measured-LED file. Prefer CSV, fall back to xlsx.
-
-    Returns (measured_dict, source_description) or (None, None) if none found."""
-    csvs = [p for p in glob.glob(os.path.join(folder, "*.csv"))]
-    for p in csvs:
+    """(measured_dict, source) from a CSV (preferred) or xlsx LIV sheet; (None, None) if none."""
+    for p in glob.glob(os.path.join(folder, "*.csv")):
         d = _read_measured_csv(p)
         if d:
             return d, os.path.basename(p)
@@ -144,12 +99,7 @@ def _find_image(folder):
     return None
 
 
-# --------------------------------------------------------------------------- #
-#  Core: predict one array (image + optional measured anchors)                 #
-# --------------------------------------------------------------------------- #
 def predict_array(img_path, measured, template, labels, n_cols, model, out_folder, name):
-    """Align, predict every LED, calibrate against the measured anchors, and
-    write the output CSV + overlay. `measured` is {(letter,num): power}."""
     img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         print(f"  ! could not read image for {name}")
@@ -160,30 +110,25 @@ def predict_array(img_path, measured, template, labels, n_cols, model, out_folde
         print(f"  ! too few LEDs detected in {name} - skipped")
         return
 
-    # 1) raw prediction for every LED on the grid
-    crop_size = E.crop_size_for(aligned)     # pitch-relative, matches the training crops
-    recs = []                                # one dict per LED
-    raw_anchor, meas_anchor = [], []         # measured LEDs, for calibration/scoring
+    crop_size = E.crop_size_for(aligned)
+    recs = []
+    raw_anchor, meas_anchor = [], []
     n_off = 0
     for (row, col), (x, y) in zip(labels, aligned):
         crop = E.crop_led(img, x, y, crop_size, True)
         feat = extract_features(crop)
-        # dark gate: an unlit LED has almost no signal -> it's off, power = 0.
         off = bool(feat[_INT_I] < DARK_INTEGRATED and feat[_PEAK_I] < DARK_PEAK)
         raw = 0.0 if off else float(model.predict(feat.reshape(1, -1))[0])
         n_off += off
         label = E.led_label(row, col)
-        key = E.normalize_label(label)
-        m = measured.get(key)
+        m = measured.get(E.normalize_label(label))
         recs.append({"label": label, "row": row, "col": col,
                      "x": int(round(x)), "y": int(round(y)),
                      "raw": raw, "off": off, "measured": m})
-        # only lit, measured LEDs anchor the calibration (a dark crop's raw is meaningless)
-        if m is not None and not off:
+        if m is not None and not off:        # only lit, measured LEDs anchor calibration
             raw_anchor.append(raw)
             meas_anchor.append(m)
 
-    # 2) blind accuracy on the measured anchors (before any calibration)
     n_anchor = len(raw_anchor)
     a, b = 1.0, 0.0
     if n_anchor >= 1:
@@ -191,7 +136,6 @@ def predict_array(img_path, measured, template, labels, n_cols, model, out_folde
         bmae, brmse, br2 = _metrics(ma, ra)
         print(f"  {name}: {n_anchor} measured LED(s) found")
         print(f"      BLIND (raw model)   MAE {bmae:6.2f}  RMSE {brmse:6.2f}  R2 {br2:6.3f}")
-        # 3) fit per-array calibration on the anchors
         a, b = _fit_calibration(ra, ma)
         if (a, b) != (1.0, 0.0):
             cal_anchor = np.clip(a * ra + b, 0.0, None)
@@ -206,17 +150,14 @@ def predict_array(img_path, measured, template, labels, n_cols, model, out_folde
         print(f"  ! {name}: none of the measured LEDs landed on the grid "
               f"- cannot calibrate (check the labels in your measured file)")
 
-    # 4) apply calibration to all LEDs, build final values
     for rec in recs:
-        # an off LED stays at 0 (skip the model + calibration entirely)
         rec["calibrated"] = 0.0 if rec["off"] else float(np.clip(a * rec["raw"] + b, 0.0, None))
-        # final value to report/draw: measured if we have it, else calibrated
         rec["final"] = rec["measured"] if rec["measured"] is not None else rec["calibrated"]
 
     if n_off:
         print(f"      {n_off} LED(s) detected as off (no light) -> set to 0 uW")
 
-    _write_csv(recs, out_folder, name, calibrated=(a, b) != (1.0, 0.0))
+    _write_csv(recs, out_folder, name)
     if SAVE_OVERLAY:
         _write_overlay(img, recs, out_folder, name, crop_size)
 
@@ -229,12 +170,10 @@ def predict_array(img_path, measured, template, labels, n_cols, model, out_folde
 
 
 def _free_path(path):
-    """Return `path` if writable, else a numbered fallback (file open in Excel etc.).
-
-    Avoids crashing when the previous output CSV/overlay is still open."""
+    """`path`, or a numbered fallback if it's locked (open in Excel)."""
     if not os.path.exists(path):
         return path
-    try:                                   # can we overwrite the existing file?
+    try:
         with open(path, "a"):
             pass
         return path
@@ -249,7 +188,7 @@ def _free_path(path):
         raise
 
 
-def _write_csv(recs, out_folder, name, calibrated):
+def _write_csv(recs, out_folder, name):
     out_csv = _free_path(os.path.join(out_folder, f"{name}_predicted.csv"))
     with open(out_csv, "w", newline="") as f:
         wri = csv.writer(f)
@@ -259,8 +198,7 @@ def _write_csv(recs, out_folder, name, calibrated):
         for r in recs:
             wri.writerow([
                 E.pad_label(r["label"]), r["row"], r["col"], r["x"], r["y"],
-                round(r["raw"], 3),
-                round(r["calibrated"], 3),
+                round(r["raw"], 3), round(r["calibrated"], 3),
                 "" if r["measured"] is None else round(r["measured"], 3),
                 round(r["final"], 3),
             ])
@@ -272,8 +210,7 @@ def _write_overlay(img, recs, out_folder, name, crop_size):
     for r in recs:
         x, y = r["x"], r["y"]
         measured = r["measured"] is not None
-        # measured LEDs in cyan box, predicted LEDs in green box
-        box_col = (255, 255, 0) if measured else (0, 255, 0)
+        box_col = (255, 255, 0) if measured else (0, 255, 0)   # measured=cyan, predicted=green
         cv2.rectangle(overlay, (x - half, y - half), (x + half, y + half), box_col, 2)
         cv2.putText(overlay, E.pad_label(r["label"]), (x - half, y - half - 12),
                     cv2.FONT_HERSHEY_SIMPLEX, 1.1, (0, 255, 255), 3)
@@ -285,21 +222,16 @@ def _write_overlay(img, recs, out_folder, name, crop_size):
                 cv2.resize(overlay, (min(1600, w), int(min(1600, w) * h / w))))
 
 
-# --------------------------------------------------------------------------- #
-#  Main: walk the Input folder (folders = calibrated, loose images = blind)    #
-# --------------------------------------------------------------------------- #
 def main():
     os.makedirs(INPUT_FOLDER, exist_ok=True)
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     if not os.path.exists(MODEL_PATH):
         raise FileNotFoundError(
-            f"No trained model at {MODEL_PATH}.\n"
-            "Run  py extract_training_crops.py  then  py train_power_model.py  first.")
+            f"No trained model at {MODEL_PATH}.\nRun  py train_power_model.py  first.")
 
     model = PowerModel.load(MODEL_PATH)
     template, n_cols, n_rows, labels = E.load_template(E.TEMPLATE_CSV)
 
-    # Each input is a FOLDER in Input/ holding the array image + a measured CSV/xlsx.
     folders = [p for p in sorted(glob.glob(os.path.join(INPUT_FOLDER, "*")))
                if os.path.isdir(p)]
     if not folders:

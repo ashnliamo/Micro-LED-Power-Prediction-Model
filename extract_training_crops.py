@@ -1,27 +1,9 @@
-"""
-Training Crop Extractor (image crops + measured power labels)
-=============================================================
-Walks a "training data" folder. Each sub-folder is one LED array and contains:
-  * a stitched array image (.png/.jpg/...)
-  * an .xlsx workbook with an LIV sheet (name contains "LIV")
+"""Crop measured LEDs from each array in Training data/ into Training Crops/.
 
-For every array it:
-  1. Reads the LIV sheet and keeps only the rows measured at
-         I_Low_mA == 0.75   and   VDD_50LED_Volt == 4.5
-     taking the corresponding Power_uW for each Channel (e.g. "X02").
-  2. Aligns the coordinate template to the image (same detect/align/refine/snap
-     pipeline as the brightness meter) and crops each LED.
-  3. Saves ONLY the LEDs that have a measured power, named by their alphabetical
-     label + power, into a per-array output folder. LEDs without a measured
-     power are skipped.
-
-A channel like "X02" maps to label "X2" (letter = column, number = row position
-in the staggered scheme - see led_label).  Output crop files are named
-    <label>_<power>uW.png        e.g.  X2_27.302uW.png
-and a manifest CSV ties every crop to its array / label / power.
-
-Requirements:
-    pip install opencv-python numpy openpyxl
+Each array sub-folder has a stitched image + an .xlsx with an LIV sheet. For each
+array: read the powers at I_Low=0.75mA / VDD=4.5V, align the rigid LED template to
+the image, and save one crop per measured LED as '<label>_<power>uW.png'.
+Also the shared alignment/crop library used by predict_power.py.
 """
 
 import cv2
@@ -32,72 +14,36 @@ import glob
 import re
 import openpyxl
 
-# CONFIG  (paths are relative to this script's folder, so the project is portable)
 BASE          = os.path.dirname(os.path.abspath(__file__))
 TRAINING_DIR  = os.path.join(BASE, "training data")
 TEMPLATE_CSV  = os.path.join(BASE, "array_coordinates_corrected.csv")
 OUTPUT_FOLDER = os.path.join(BASE, "Training Crops")
 
-# Which LIV measurement to label crops with:
 I_LOW_TARGET  = 0.75   # mA
-VDD_TARGET    = 4.5    # V (VDD_50LED_Volt)
-TOL           = 1e-6   # float compare tolerance
+VDD_TARGET    = 4.5    # V
+TOL           = 1e-6
 
-# Crop size is RESOLUTION-INDEPENDENT: the square side is a fixed fraction of the
-# detected LED pitch, so every LED is framed the same way regardless of whether the
-# image is a high-res stitch or a smaller single shot.  CROP_SIZE is only a fallback
-# (e.g. if the pitch can't be measured).
-CROP_FRACTION = 0.60   # crop side = this fraction of the LED pitch (~115px at a 190px pitch)
-CROP_SIZE     = 115    # fallback square side (px) if the LED pitch is unavailable
-SAVE_COLOR    = True   # True -> colour crop; False -> blue channel only
-PAD_EDGE      = True   # zero-pad edge crops so every crop is exactly crop_size^2
+# Crop side = fraction of detected LED pitch (resolution-independent); CROP_SIZE is a fallback.
+CROP_FRACTION = 0.60
+CROP_SIZE     = 115
+SAVE_COLOR    = True
+PAD_EDGE      = True
 
-# Alignment is RIGID: the constant LED template is placed with a single
-# similarity transform (rotation + uniform scale + translation) only. Boxes are
-# never moved individually to chase the image - the whole grid moves together.
-GATE_FRAC     = 0.40   # match radius as a fraction of LED spacing (< 0.5 so a
-                       # grid point can only match its OWN LED, not a neighbour)
+# Rigid alignment (single similarity transform; the whole grid moves together).
+GATE_FRAC          = 0.40   # match radius as a fraction of LED pitch (<0.5)
+MAX_SCALE_DECREASE = 0.25   # grid may shrink at most this far below the pitch-implied scale
+MAX_COL_SHIFT      = 6      # grid-offset search range, columns
+MAX_ROW_SHIFT      = 4      # grid-offset search range, rows
+MIN_SHIFT_GAIN     = 0.05   # accept a row shift only if it lands >=5% more points on LEDs
 
-# The correct grid scale is fixed by the LED pitch (detected spacing / template
-# spacing) - a robust, corner-independent estimate. We forbid the fit from
-# shrinking the grid more than this fraction below that pitch-implied scale, so
-# it can't collapse into a dense cluster and rack up bogus matches.
-MAX_SCALE_DECREASE = 0.25   # e.g. 0.25 -> grid may be at most 25% smaller
-
-# Step-2 grid offset: the angle/scale fit is reliable, but if a corner LED is
-# off the grid can settle a row or column off. We align COLUMNS first, then ROWS,
-# each by whole-cell slides, keeping the slide that lands the most grid points on
-# real LEDs. A single-column slide carries the half-row stagger automatically
-# (the template's column vector is ~half a row lower for each step), so odd
-# column slides shift the grid ~100px vertically and even slides cancel it out.
-MAX_COL_SHIFT  = 6     # search +/- this many COLUMNS
-MAX_ROW_SHIFT  = 4     # search +/- this many ROWS
-MIN_SHIFT_GAIN = 0.05  # only accept a shift if it lands >=5% more grid points on
-                       # LEDs than no shift. A real cell-offset exposes a whole
-                       # row/column (>10% gain); a spurious shift gains 1-2%, so
-                       # this keeps an already-correct grid (and ambiguous sparse
-                       # arrays) from being nudged onto a wrong-label position.
-
-# Dot detection tuning
 THRESH_FRAC   = 0.37
 MIN_AREA      = 40
 
 
-# --------------------------------------------------------------------------- #
-#  Labelling                                                                   #
-# --------------------------------------------------------------------------- #
 def led_label(row, col):
-    """Map (row, col) -> array label like 'C33'.
-
-    Column letter:  cols 1-12 -> A-L, cols 13-24 -> N-Y  (M is skipped).
-    Row number depends on the column group:
-      "odd"  columns {1,3,5,7,9,11,14,16,18,20,22,24} use
-             1,3,5,7,9,11,13,15,19,21,23,25,27,29,31,33  (odds 1-33, skipping 17)
-      "even" columns (the rest) use
-             2,4,6,8,10,12,14,16,18,20,22,24,26,28,30,32  (clean evens)
-    Only 17 is ever skipped (in the odd group); the even group has no gap.
-    """
-    letters = "ABCDEFGHIJKLNOPQRSTUVWXY"          # 24 letters, M omitted
+    """(row, col) -> label like 'C33'. Cols 1-12 -> A-L, 13-24 -> N-Y (no M);
+    odd-group columns skip row 17, even group is clean evens."""
+    letters = "ABCDEFGHIJKLNOPQRSTUVWXY"
     odd_cols = {1, 3, 5, 7, 9, 11, 14, 16, 18, 20, 22, 24}
     odd_rows  = [1, 3, 5, 7, 9, 11, 13, 15, 19, 21, 23, 25, 27, 29, 31, 33]
     even_rows = [2, 4, 6, 8, 10, 12, 14, 16, 18, 20, 22, 24, 26, 28, 30, 32]
@@ -106,36 +52,21 @@ def led_label(row, col):
 
 
 def pad_label(label):
-    """Display form with a zero-padded 2-digit number: 'A1' -> 'A01', 'C33' -> 'C33'.
-
-    Used only for drawing labels on overlay images; the CSV/filename labels keep
-    their unpadded form."""
+    """'A1' -> 'A01' (zero-pad the number, for display/CSV)."""
     m = re.fullmatch(r"([A-Za-z]+)(\d+)", str(label))
     return f"{m.group(1)}{int(m.group(2)):02d}" if m else str(label)
 
 
 def normalize_label(text):
-    """'X02' or 'X2' -> ('X', 2). Returns None if it doesn't look like a label."""
+    """'X02' or 'X2' -> ('X', 2), or None."""
     m = re.fullmatch(r"\s*([A-Za-z]+)\s*0*(\d+)\s*", str(text))
     if not m:
         return None
     return (m.group(1).upper(), int(m.group(2)))
 
 
-def build_label_index(n_rows, n_cols):
-    """Reverse map  (letter, number) -> (row, col)  for the whole grid."""
-    idx = {}
-    for r in range(1, n_rows + 1):
-        for c in range(1, n_cols + 1):
-            idx[normalize_label(led_label(r, c))] = (r, c)
-    return idx
-
-
-# --------------------------------------------------------------------------- #
-#  Spreadsheet                                                                 #
-# --------------------------------------------------------------------------- #
 def read_liv_powers(xlsx_path):
-    """Return {(letter, number): power_uW} for rows at I_LOW_TARGET / VDD_TARGET."""
+    """{(letter, number): power_uW} for LIV rows at I_LOW_TARGET / VDD_TARGET; also the sheet name."""
     wb = openpyxl.load_workbook(xlsx_path, read_only=True, data_only=True)
     liv = next((s for s in wb.sheetnames if "LIV" in s.upper()), None)
     if liv is None:
@@ -166,9 +97,6 @@ def read_liv_powers(xlsx_path):
     return powers, liv
 
 
-# --------------------------------------------------------------------------- #
-#  Alignment / cropping pipeline (shared with the brightness meter)            #
-# --------------------------------------------------------------------------- #
 def load_template(path):
     with open(path, newline="") as f:
         reader = csv.reader(f)
@@ -199,8 +127,7 @@ def detect_dots(blue):
 
 
 def similarity_from_2pts(src, dst):
-    """Rigid similarity (rotation + uniform scale + translation) mapping the
-    src point pair onto the dst point pair."""
+    """Similarity (rotation + uniform scale + translation) mapping src pair -> dst pair."""
     (ax, ay), (bx, by) = src
     (Ax, Ay), (Bx, By) = dst
     vx, vy = bx - ax, by - ay
@@ -221,31 +148,25 @@ def _apply(M, pts):
 
 
 def _nearest_dist(pts, detected):
-    """Distance from each point in pts to the nearest detected dot."""
     d2 = ((pts[:, None, :] - detected[None, :, :]) ** 2).sum(axis=2)
     return np.sqrt(d2.min(axis=1))
 
 
 def _median_spacing(points):
-    """Median nearest-neighbour distance among points (the LED pitch)."""
     d2 = ((points[:, None, :] - points[None, :, :]) ** 2).sum(axis=2)
     np.fill_diagonal(d2, np.inf)
     return float(np.median(np.sqrt(d2.min(axis=1))))
 
 
 def _scale_of(M):
-    """Uniform scale factor of a similarity transform."""
     return float(np.hypot(M[0, 0], M[1, 0]))
 
 
 def _corner_candidates(detected):
-    """A handful of plausible top-left / top-right anchor dots.
-
-    Robust to a missing corner LED: we try several extremes and let the global
-    consensus score (in fit_rigid_transform) pick the right combination."""
+    """Plausible top-left / top-right anchor dots (consensus picks the right pair)."""
     x, y = detected[:, 0], detected[:, 1]
-    o_sum = np.argsort(x + y)        # top-left  -> small x+y
-    o_diff = np.argsort(x - y)       # top-right -> large x-y
+    o_sum = np.argsort(x + y)
+    o_diff = np.argsort(x - y)
     o_x, o_y = np.argsort(x), np.argsort(y)
     tl = list(o_sum[:3]) + list(o_x[:2]) + list(o_y[:2])
     tr = list(o_diff[-3:]) + list(o_x[-2:]) + list(o_y[:2])
@@ -254,98 +175,70 @@ def _corner_candidates(detected):
 
 
 def _best_slide(base, deltas, detected, gate):
-    """Given candidate whole-grid translations {k: delta}, pick the k whose grid
-    lands the most points on LEDs. Only accept a non-zero k if it clears the
-    gain threshold over k=0, else stay put. Returns (k, delta)."""
+    """Pick the translation k landing the most points on LEDs; keep k=0 unless the
+    best clears MIN_SHIFT_GAIN. Returns (k, delta)."""
     inl = {k: int((_nearest_dist(base + d, detected) < gate).sum()) for k, d in deltas.items()}
     inl0 = inl[0]
-    best = max(inl, key=lambda k: (inl[k], -abs(k)))   # max inliers, smaller |k| wins ties
+    best = max(inl, key=lambda k: (inl[k], -abs(k)))
     if inl[best] - inl0 < max(4, MIN_SHIFT_GAIN * inl0):
         best = 0
     return best, deltas[best]
 
 
 def _gap_column_offset(M, template, n_cols, n_rows, detected):
-    """Column offset from aligning the array's THREE black columns to the image.
-
-    Every array has the same black structure horizontally:
-      * the empty centre gap - the imaginary column 'N' between physical columns
-        12 and 13, where the template has a double-width spacing, and
-      * the two black edges just beyond the outermost LED columns (A and Y).
-    No LEDs ever fall in the centre gap or outside the A..Y span, so these three
-    empty strips are a far more reliable horizontal fiducial than counting LED
-    overlaps. We map the detected LEDs into the template frame and pick the
-    whole-column shift that puts the fewest LEDs in any black strip - i.e. the
-    centre gap empty AND every LED inside the array edges. Returns +k (grid must
-    move right k columns); ties prefer no shift."""
+    """Column offset that keeps the three black columns empty: the centre 'N' gap
+    (between cols 12 and 13) and the two edges beyond cols A and Y. Returns +k
+    (move grid right k columns)."""
     tcolx = template.reshape(n_rows, n_cols, 2)[0, :, 0]
-    gap_x = (tcolx[11] + tcolx[12]) / 2.0                 # imaginary column N (centre)
-    colA, colY = tcolx[0], tcolx[-1]                      # outermost LED columns
-    colw = float(np.median(np.diff(tcolx[:12])))          # column pitch (gap-free side)
+    gap_x = (tcolx[11] + tcolx[12]) / 2.0
+    colA, colY = tcolx[0], tcolx[-1]
+    colw = float(np.median(np.diff(tcolx[:12])))
     Minv = cv2.invertAffineTransform(M)
     xs = cv2.transform(np.asarray(detected, np.float32).reshape(-1, 1, 2),
-                       Minv).reshape(-1, 2)[:, 0]         # LED x in template frame
+                       Minv).reshape(-1, 2)[:, 0]
     best_k, best_viol = 0, None
     for k in range(-MAX_COL_SHIFT, MAX_COL_SHIFT + 1):
         c, a, y = gap_x + k * colw, colA + k * colw, colY + k * colw
-        viol = int(((xs > c - colw / 2) & (xs < c + colw / 2)).sum())   # LEDs in centre gap
-        viol += int((xs < a - colw / 2).sum())                         # LEDs left of array
-        viol += int((xs > y + colw / 2).sum())                         # LEDs right of array
+        viol = int(((xs > c - colw / 2) & (xs < c + colw / 2)).sum())
+        viol += int((xs < a - colw / 2).sum())
+        viol += int((xs > y + colw / 2).sum())
         if best_viol is None or viol < best_viol or (viol == best_viol and abs(k) < abs(best_k)):
             best_viol, best_k = viol, k
     return best_k
 
 
 def correct_grid_offset(M, template, n_cols, detected, gate):
-    """Step 2: align COLUMNS (via the black 'column N' gap), then ROWS (by inliers).
-
-    Columns are placed by aligning the always-empty gap column to the image's
-    black column - robust even when the array's own LEDs are dim or ambiguous,
-    where counting LED overlaps fails. The single-column slide uses the template's
-    own column vector (carrying the ~half-row stagger). Rows are then slid one
-    (un-staggered) row at a time, keeping the row with the most LED overlaps and a
-    clear gain over no-shift.
-
-    Returns (M, row_shift, col_shift); +row_shift = up rows, +col_shift = left columns."""
+    """Step 2: align columns via the black 'N' gap, then rows by inlier slides.
+    Returns (M, row_shift, col_shift); +row_shift = up, +col_shift = left."""
     base = _apply(M, template)
-    base0 = base[0]                                            # row 1, col 1
-    row_vec = _apply(M, template[n_cols:n_cols + 1])[0] - base0  # one row DOWN
+    base0 = base[0]
+    row_vec = _apply(M, template[n_cols:n_cols + 1])[0] - base0   # one row down
     n_rows = len(template) // n_cols
 
     def col_disp(k):
         if k == 0:
             return np.zeros(2, np.float32)
-        d = _apply(M, template[abs(k):abs(k) + 1])[0] - base0  # |k| columns RIGHT
-        return d if k > 0 else -d                              # left = exact mirror
+        d = _apply(M, template[abs(k):abs(k) + 1])[0] - base0     # |k| cols right (carries stagger)
+        return d if k > 0 else -d
 
-    # 1) columns: align the imaginary gap column ("N") to the image's black column
     kc = _gap_column_offset(M, template, n_cols, n_rows, detected)
     dcol = col_disp(kc)
 
-    # 2) rows, from the column-corrected position (inlier search)
     row_deltas = {k: (k * row_vec).astype(np.float32) for k in range(-MAX_ROW_SHIFT, MAX_ROW_SHIFT + 1)}
     kr, drow = _best_slide(base + dcol, row_deltas, detected, gate)
 
     M2 = M.copy()
     M2[:, 2] += (dcol + drow).astype(M.dtype)
-    return M2, -kr, -kc   # +row_shift = up rows, +col_shift = left columns
+    return M2, -kr, -kc
 
 
 def fit_rigid_transform(template, n_cols, detected):
-    """Best RIGID (similarity) transform placing the constant template on the
-    detected LEDs.
-
-    Step 1 - angle/scale/position: try several corner anchors and keep the one
-    that lands the most template points on real LEDs (global consensus ->
-    immune to the shifted-lattice trap), then one rigid polish.
-    Step 2 - edge correction: snap the grid onto the array's true top/bottom and
-    left/right borders.
-    Returns (M, (tl, tr), (row_shift, col_shift))."""
+    """Best similarity transform placing the template on the detected LEDs:
+    consensus over corner anchors (scale floored to the pitch), a rigid polish,
+    then correct_grid_offset. Returns (M, (tl, tr), (row_shift, col_shift))."""
     t_tl, t_tr = template[0], template[n_cols - 1]
     spacing = _median_spacing(detected)
     gate = GATE_FRAC * spacing
-    # scale the grid SHOULD have, from the LED pitch; floor below which we won't
-    # let it shrink (rejects the collapsed-grid degeneracy)
     ref_scale = spacing / _median_spacing(template)
     min_scale = (1.0 - MAX_SCALE_DECREASE) * ref_scale
 
@@ -357,22 +250,19 @@ def fit_rigid_transform(template, n_cols, detected):
             if np.allclose(a, b):
                 continue
             M = similarity_from_2pts([t_tl, t_tr], [a, b])
-            # keep a scale-sane fallback in case nothing clears the floor
             gap = abs(_scale_of(M) - ref_scale)
             if gap < fallback_gap:
                 fallback_M, fallback_corners, fallback_gap = M, (a, b), gap
             if _scale_of(M) < min_scale:
-                continue                      # too small -> reject collapse
+                continue
             inliers = int((_nearest_dist(_apply(M, template), detected) < gate).sum())
             if inliers > best_inliers:
                 best_M, best_inliers, best_corners = M, inliers, (a, b)
 
-    if best_M is None:                        # every candidate was below the floor
+    if best_M is None:
         best_M, best_corners = fallback_M, fallback_corners
 
-    # one rigid polish: re-fit a similarity to the consensus matches (keeps the
-    # grid rigid - estimateAffinePartial2D has no shear/aspect freedom). The
-    # scale floor still applies, so the polish can't collapse the grid either.
+    # rigid polish: re-fit a similarity to the consensus matches (scale floor still applies)
     M = best_M
     for _ in range(2):
         P = _apply(M, template)
@@ -389,13 +279,12 @@ def fit_rigid_transform(template, n_cols, detected):
             break
         M = M2.astype(np.float32)
 
-    # step 2: snap onto the true borders (fixes a row/column off from an unlit corner)
     M, row_shift, col_shift = correct_grid_offset(M, template, n_cols, detected, gate)
     return M, best_corners, (row_shift, col_shift)
 
 
 def led_pitch(points):
-    """Median nearest-neighbour distance among the aligned LED centres (LED pitch, px)."""
+    """Median nearest-neighbour distance among aligned LED centres (px)."""
     pts = np.asarray(points, np.float64)
     if len(pts) < 2:
         return float(CROP_SIZE)
@@ -408,9 +297,7 @@ def led_pitch(points):
 
 
 def crop_size_for(points):
-    """Resolution-independent square crop side (px): a fixed fraction of the LED pitch.
-
-    Falls back to CROP_SIZE if the pitch can't be measured."""
+    """Square crop side (px) = CROP_FRACTION * LED pitch; CROP_SIZE if unavailable."""
     pitch = led_pitch(points)
     if not np.isfinite(pitch) or pitch <= 0:
         return CROP_SIZE
@@ -437,10 +324,7 @@ def crop_led(img, cx, cy, size, pad):
 
 
 def align_image(img, template, n_cols):
-    """Place the rigid template on the image. Returns (blue, aligned_pts, corners).
-
-    aligned_pts are the per-LED centres from ONE rigid similarity transform;
-    they are never nudged individually."""
+    """Place the rigid template on the image -> (blue, aligned_pts, corners, shifts)."""
     blue = cv2.cvtColor(img, cv2.COLOR_BGR2RGB)[:, :, 2].astype(np.float32)
     detected = detect_dots(blue)
     if len(detected) < 4:
@@ -450,9 +334,6 @@ def align_image(img, template, n_cols):
     return blue, aligned, corners, shifts
 
 
-# --------------------------------------------------------------------------- #
-#  Per-array processing                                                        #
-# --------------------------------------------------------------------------- #
 IMG_EXTS = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff")
 
 
@@ -464,7 +345,7 @@ def find_one(folder, patterns):
     return None
 
 
-def process_array(array_dir, template, labels, n_cols, label_index, out_root):
+def process_array(array_dir, template, labels, n_cols, out_root):
     name = os.path.basename(array_dir.rstrip("\\/"))
     img_path = find_one(array_dir, IMG_EXTS)
     xlsx_path = find_one(array_dir, ("*.xlsx",))
@@ -472,7 +353,7 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
         print(f"  ! {name}: missing image or xlsx - skipped")
         return []
 
-    powers, liv_sheet = read_liv_powers(xlsx_path)
+    powers, _ = read_liv_powers(xlsx_path)
     if not powers:
         print(f"  ! {name}: no measurements at {I_LOW_TARGET}mA / {VDD_TARGET}V - skipped")
         return []
@@ -490,7 +371,7 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
     out_dir = os.path.join(out_root, name)
     os.makedirs(out_dir, exist_ok=True)
 
-    crop_size = crop_size_for(aligned)     # pitch-relative, so crops are resolution-independent
+    crop_size = crop_size_for(aligned)
     overlay = img.copy()
     half = crop_size // 2
     rows_written = []
@@ -498,7 +379,7 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
     for (row, col), (x, y) in zip(labels, aligned):
         key = normalize_label(led_label(row, col))
         if key not in powers:
-            continue                       # this LED has no measured power -> skip
+            continue
         matched.add(key)
         power = powers[key]
         label = led_label(row, col)
@@ -520,12 +401,10 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
     for (x, y) in corners:
         cv2.circle(overlay, (int(x), int(y)), 34, (0, 0, 255), 4)
 
-    # verification overlay (only the labelled LEDs are boxed)
     h, w = overlay.shape[:2]
     cv2.imwrite(os.path.join(out_root, f"{name}_verify.png"),
                 cv2.resize(overlay, (min(1600, w), int(min(1600, w) * h / w))))
 
-    # per-array manifest
     with open(os.path.join(out_dir, "labels.csv"), "w", newline="") as f:
         wri = csv.DictWriter(f, fieldnames=["array", "label", "row", "col",
                                             "x", "y", "Power_uW", "crop_file"])
@@ -550,7 +429,6 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
 def main():
     os.makedirs(OUTPUT_FOLDER, exist_ok=True)
     template, n_cols, n_rows, labels = load_template(TEMPLATE_CSV)
-    label_index = build_label_index(n_rows, n_cols)
     print(f"Template: {n_cols} x {n_rows} = {len(template)} dots")
     print(f"Labelling crops at I_Low={I_LOW_TARGET}mA, VDD={VDD_TARGET}V  |  "
           f"crop {CROP_FRACTION:.0%} of LED pitch  |  "
@@ -564,7 +442,7 @@ def main():
 
     all_rows = []
     for d in array_dirs:
-        all_rows.extend(process_array(d, template, labels, n_cols, label_index, OUTPUT_FOLDER))
+        all_rows.extend(process_array(d, template, labels, n_cols, OUTPUT_FOLDER))
 
     manifest = os.path.join(OUTPUT_FOLDER, "training_manifest.csv")
     with open(manifest, "w", newline="") as f:
