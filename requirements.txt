@@ -1,0 +1,10 @@
+# Pin scikit-learn + joblib to match the version the model was trained/saved with
+# (loading a joblib model across different scikit-learn versions can fail/warn).
+scikit-learn==1.9.0
+joblib==1.5.3
+
+# These are flexible
+opencv-python>=4.8
+numpy>=1.26
+openpyxl>=3.1
+matplotlib>=3.7

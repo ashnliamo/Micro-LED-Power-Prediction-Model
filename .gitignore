@@ -12,3 +12,9 @@ memory/
 
 # Debug / scratch
 _left42.png
+
+# Template backups (kept on disk for re-extraction, not versioned; original is in git history)
+*.bak
+
+# Distributable bundle
+*.zip

@@ -53,12 +53,12 @@ import matplotlib.pyplot as plt
 
 from sklearn.model_selection import KFold, LeaveOneGroupOut, cross_val_predict
 
-from power_model import PowerModel, extract_features, features_from_file, FEATURE_NAMES
+from power_model import PowerModel, features_from_file, FEATURE_NAMES
 import extract_training_crops as E
 from extract_training_crops import pad_label
 
 # CONFIG
-BASE          = r"C:\Users\liam.deacon\Desktop\brightness test rotate"
+BASE          = os.path.dirname(os.path.abspath(__file__))   # portable: this script's folder
 CROPS_ROOT    = os.path.join(BASE, "Training Crops")
 OUTPUT_FOLDER = os.path.join(BASE, "Model")
 

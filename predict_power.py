@@ -1,30 +1,27 @@
 """
 Predict LED Power from an Array Image
 =====================================
-Two ways to use the Input folder:
+Drop a FOLDER in Input/ (like the training-data folders) containing:
+     <the array image>            e.g. Analysis_image-Stitched_-9.png
+     a measured CSV or .xlsx      the 40 (or however many) LEDs you measured
+-> CALIBRATED prediction. The measured LEDs are used as anchors to remove that
+   array's exposure offset, so the unmeasured LEDs are predicted on the correct
+   absolute scale. You also get an honest "blind" accuracy report (how the raw
+   model did on the measured LEDs before calibration).
 
-  A) Drop a single array IMAGE in Input/         -> blind prediction.
-     Every LED's power is predicted from the photo alone.
+The measured file can be either:
+   * a CSV with a label column (label / Channel) and a Power_uW column
+     (the same columns as Training Crops/<array>/labels.csv works too), or
+   * the array's .xlsx workbook (its LIV sheet is read at
+     I_Low=0.75 mA / VDD_50LED=4.5 V, exactly like the training pipeline).
 
-  B) Drop a FOLDER in Input/ (like the training-data folders) containing:
-         <the array image>            e.g. Analysis_image-Stitched_-9.png
-         a measured CSV or .xlsx      the 40 (or however many) LEDs you measured
-     -> CALIBRATED prediction. The measured LEDs are used as anchors to remove
-        that array's exposure offset, so the unmeasured LEDs are predicted on the
-        correct absolute scale. You also get an honest "blind" accuracy report
-        (how the raw model did on the measured LEDs before calibration).
-
-     The measured file can be either:
-        * a CSV with a label column (label / Channel) and a Power_uW column
-          (the same columns as Training Crops/<array>/labels.csv works too), or
-        * the array's .xlsx workbook (its LIV sheet is read at
-          I_Low=0.75 mA / VDD_50LED=4.5 V, exactly like the training pipeline).
+A folder with no measured file is skipped (measurements are required so the
+prediction can be calibrated to that array's exposure).
 
 For every input it writes a CSV + labelled overlay to the Output folder.
 
 Train the model first if it doesn't exist yet:
-    py extract_training_crops.py      # build labelled crops from training data
-    py train_power_model.py           # fit + save Model/power_model.joblib
+    py train_power_model.py           # extracts crops + fits + saves Model/power_model.joblib
 
 Usage:
     py predict_power.py               # processes every image/folder in Input/
@@ -40,15 +37,25 @@ import numpy as np
 import cv2
 
 import extract_training_crops as E          # reuse the alignment pipeline
-from power_model import PowerModel
+from power_model import PowerModel, extract_features, FEATURE_NAMES
+
+_INT_I = FEATURE_NAMES.index("integrated")  # feature indices used by the dark gate
+_PEAK_I = FEATURE_NAMES.index("peak")
 
 # CONFIG
-BASE          = r"C:\Users\liam.deacon\Desktop\brightness test rotate"
+BASE          = os.path.dirname(os.path.abspath(__file__))   # portable: this script's folder
 INPUT_FOLDER  = os.path.join(BASE, "Input")
 OUTPUT_FOLDER = os.path.join(BASE, "Output")
 MODEL_PATH    = os.path.join(BASE, "Model", "power_model.joblib")
 SAVE_OVERLAY  = True                         # also write a labelled verification image
 MIN_CALIB_PTS = 3                            # need this many measured LEDs to calibrate
+
+# Dark/"off" LED gate: a crop with essentially no light is forced to 0 uW, instead
+# of letting the model (which can't output 0) and calibration invent power for it.
+# Lit LEDs have integrated > 350k / peak > 60 even at ~2 uW; dead ones sit near 3k / 4,
+# so this threshold sits safely in the wide gap between them.
+DARK_INTEGRATED = 50000.0                    # integrated signal below this => LED is off
+DARK_PEAK       = 30.0                        # ...and peak below this => off
 
 IMG_EXTS = ("*.png", "*.jpg", "*.jpeg", "*.bmp", "*.tif", "*.tiff")
 
@@ -141,8 +148,8 @@ def _find_image(folder):
 #  Core: predict one array (image + optional measured anchors)                 #
 # --------------------------------------------------------------------------- #
 def predict_array(img_path, measured, template, labels, n_cols, model, out_folder, name):
-    """Align, predict every LED, optionally calibrate against measured anchors,
-    and write the output CSV + overlay. `measured` is {(letter,num): power} or None."""
+    """Align, predict every LED, calibrate against the measured anchors, and
+    write the output CSV + overlay. `measured` is {(letter,num): power}."""
     img = cv2.imdecode(np.fromfile(img_path, dtype=np.uint8), cv2.IMREAD_COLOR)
     if img is None:
         print(f"  ! could not read image for {name}")
@@ -154,18 +161,25 @@ def predict_array(img_path, measured, template, labels, n_cols, model, out_folde
         return
 
     # 1) raw prediction for every LED on the grid
+    crop_size = E.crop_size_for(aligned)     # pitch-relative, matches the training crops
     recs = []                                # one dict per LED
     raw_anchor, meas_anchor = [], []         # measured LEDs, for calibration/scoring
+    n_off = 0
     for (row, col), (x, y) in zip(labels, aligned):
-        crop = E.crop_led(img, x, y, E.CROP_SIZE, True)
-        raw = float(model.predict_crop(crop))
+        crop = E.crop_led(img, x, y, crop_size, True)
+        feat = extract_features(crop)
+        # dark gate: an unlit LED has almost no signal -> it's off, power = 0.
+        off = bool(feat[_INT_I] < DARK_INTEGRATED and feat[_PEAK_I] < DARK_PEAK)
+        raw = 0.0 if off else float(model.predict(feat.reshape(1, -1))[0])
+        n_off += off
         label = E.led_label(row, col)
         key = E.normalize_label(label)
-        m = measured.get(key) if measured else None
+        m = measured.get(key)
         recs.append({"label": label, "row": row, "col": col,
                      "x": int(round(x)), "y": int(round(y)),
-                     "raw": raw, "measured": m})
-        if m is not None:
+                     "raw": raw, "off": off, "measured": m})
+        # only lit, measured LEDs anchor the calibration (a dark crop's raw is meaningless)
+        if m is not None and not off:
             raw_anchor.append(raw)
             meas_anchor.append(m)
 
@@ -189,17 +203,22 @@ def predict_array(img_path, measured, template, labels, n_cols, model, out_folde
             print(f"      (not enough spread to calibrate - need >= {MIN_CALIB_PTS} "
                   f"measured LEDs across a power range; left uncalibrated)")
     else:
-        print(f"  {name}: no measured LEDs supplied - blind prediction only")
+        print(f"  ! {name}: none of the measured LEDs landed on the grid "
+              f"- cannot calibrate (check the labels in your measured file)")
 
     # 4) apply calibration to all LEDs, build final values
     for rec in recs:
-        rec["calibrated"] = float(np.clip(a * rec["raw"] + b, 0.0, None))
+        # an off LED stays at 0 (skip the model + calibration entirely)
+        rec["calibrated"] = 0.0 if rec["off"] else float(np.clip(a * rec["raw"] + b, 0.0, None))
         # final value to report/draw: measured if we have it, else calibrated
         rec["final"] = rec["measured"] if rec["measured"] is not None else rec["calibrated"]
 
+    if n_off:
+        print(f"      {n_off} LED(s) detected as off (no light) -> set to 0 uW")
+
     _write_csv(recs, out_folder, name, calibrated=(a, b) != (1.0, 0.0))
     if SAVE_OVERLAY:
-        _write_overlay(img, recs, out_folder, name)
+        _write_overlay(img, recs, out_folder, name, crop_size)
 
     note = ""
     if shifts and any(shifts):
@@ -247,9 +266,9 @@ def _write_csv(recs, out_folder, name, calibrated):
             ])
 
 
-def _write_overlay(img, recs, out_folder, name):
+def _write_overlay(img, recs, out_folder, name, crop_size):
     overlay = img.copy()
-    half = E.CROP_SIZE // 2
+    half = crop_size // 2
     for r in recs:
         x, y = r["x"], r["y"]
         measured = r["measured"] is not None
@@ -280,23 +299,16 @@ def main():
     model = PowerModel.load(MODEL_PATH)
     template, n_cols, n_rows, labels = E.load_template(E.TEMPLATE_CSV)
 
-    # folders in Input/ -> calibrated jobs
+    # Each input is a FOLDER in Input/ holding the array image + a measured CSV/xlsx.
     folders = [p for p in sorted(glob.glob(os.path.join(INPUT_FOLDER, "*")))
                if os.path.isdir(p)]
-    # loose images directly in Input/ -> blind jobs
-    loose = []
-    for ext in IMG_EXTS:
-        loose.extend(glob.glob(os.path.join(INPUT_FOLDER, ext)))
-    loose.sort()
-
-    if not folders and not loose:
-        print(f"Nothing to do. Put either:")
-        print(f"  - a single array image in {INPUT_FOLDER}  (blind prediction), or")
-        print(f"  - a folder (image + measured CSV/xlsx) in {INPUT_FOLDER}  (calibrated)")
+    if not folders:
+        print(f"Nothing to do. Put a folder in {INPUT_FOLDER} containing the array")
+        print(f"image and a measured CSV/xlsx, then run again.")
         return
 
     print(f"Model: {os.path.basename(MODEL_PATH)}")
-    print(f"Jobs: {len(folders)} folder(s) + {len(loose)} loose image(s)\n")
+    print(f"Jobs: {len(folders)} folder(s)\n")
 
     for folder in folders:
         name = os.path.basename(folder.rstrip("\\/"))
@@ -305,14 +317,12 @@ def main():
             print(f"  ! {name}: no image found in folder - skipped")
             continue
         measured, src = _find_measured(folder)
-        if src:
-            print(f"  [{name}] image: {os.path.basename(img_path)} | measured: {src}")
+        if not measured:
+            print(f"  ! {name}: no measured CSV/xlsx found in folder - skipped "
+                  f"(measurements are required for calibration)")
+            continue
+        print(f"  [{name}] image: {os.path.basename(img_path)} | measured: {src}")
         predict_array(img_path, measured, template, labels, n_cols, model,
-                      OUTPUT_FOLDER, name)
-
-    for fp in loose:
-        name = os.path.splitext(os.path.basename(fp))[0]
-        predict_array(fp, None, template, labels, n_cols, model,
                       OUTPUT_FOLDER, name)
 
     print(f"\nDone. Results in: {OUTPUT_FOLDER}")

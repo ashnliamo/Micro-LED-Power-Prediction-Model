@@ -32,19 +32,25 @@ import glob
 import re
 import openpyxl
 
-# CONFIG
-TRAINING_DIR  = r"C:\Users\liam.deacon\Desktop\brightness test rotate\training data"
-TEMPLATE_CSV  = r"C:\Users\liam.deacon\Desktop\brightness test rotate\array_coordinates_corrected.csv"
-OUTPUT_FOLDER = r"C:\Users\liam.deacon\Desktop\brightness test rotate\Training Crops"
+# CONFIG  (paths are relative to this script's folder, so the project is portable)
+BASE          = os.path.dirname(os.path.abspath(__file__))
+TRAINING_DIR  = os.path.join(BASE, "training data")
+TEMPLATE_CSV  = os.path.join(BASE, "array_coordinates_corrected.csv")
+OUTPUT_FOLDER = os.path.join(BASE, "Training Crops")
 
 # Which LIV measurement to label crops with:
 I_LOW_TARGET  = 0.75   # mA
 VDD_TARGET    = 4.5    # V (VDD_50LED_Volt)
 TOL           = 1e-6   # float compare tolerance
 
-CROP_SIZE     = 160    # side length (px) of the SQUARE crop saved per LED.
+# Crop size is RESOLUTION-INDEPENDENT: the square side is a fixed fraction of the
+# detected LED pitch, so every LED is framed the same way regardless of whether the
+# image is a high-res stitch or a smaller single shot.  CROP_SIZE is only a fallback
+# (e.g. if the pitch can't be measured).
+CROP_FRACTION = 0.60   # crop side = this fraction of the LED pitch (~115px at a 190px pitch)
+CROP_SIZE     = 115    # fallback square side (px) if the LED pitch is unavailable
 SAVE_COLOR    = True   # True -> colour crop; False -> blue channel only
-PAD_EDGE      = True   # zero-pad edge crops so every crop is exactly CROP_SIZE^2
+PAD_EDGE      = True   # zero-pad edge crops so every crop is exactly crop_size^2
 
 # Alignment is RIGID: the constant LED template is placed with a single
 # similarity transform (rotation + uniform scale + translation) only. Boxes are
@@ -388,6 +394,29 @@ def fit_rigid_transform(template, n_cols, detected):
     return M, best_corners, (row_shift, col_shift)
 
 
+def led_pitch(points):
+    """Median nearest-neighbour distance among the aligned LED centres (LED pitch, px)."""
+    pts = np.asarray(points, np.float64)
+    if len(pts) < 2:
+        return float(CROP_SIZE)
+    nn = []
+    for i in range(len(pts)):
+        d = np.hypot(pts[:, 0] - pts[i, 0], pts[:, 1] - pts[i, 1])
+        d[i] = np.inf
+        nn.append(d.min())
+    return float(np.median(nn))
+
+
+def crop_size_for(points):
+    """Resolution-independent square crop side (px): a fixed fraction of the LED pitch.
+
+    Falls back to CROP_SIZE if the pitch can't be measured."""
+    pitch = led_pitch(points)
+    if not np.isfinite(pitch) or pitch <= 0:
+        return CROP_SIZE
+    return max(16, int(round(CROP_FRACTION * pitch)))
+
+
 def crop_led(img, cx, cy, size, pad):
     h, w = img.shape[:2]
     half = size // 2
@@ -461,8 +490,9 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
     out_dir = os.path.join(out_root, name)
     os.makedirs(out_dir, exist_ok=True)
 
+    crop_size = crop_size_for(aligned)     # pitch-relative, so crops are resolution-independent
     overlay = img.copy()
-    half = CROP_SIZE // 2
+    half = crop_size // 2
     rows_written = []
     matched = set()
     for (row, col), (x, y) in zip(labels, aligned):
@@ -474,7 +504,7 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
         label = led_label(row, col)
 
         source = img if SAVE_COLOR else blue_u8
-        crop = crop_led(source, x, y, CROP_SIZE, PAD_EDGE)
+        crop = crop_led(source, x, y, crop_size, PAD_EDGE)
 
         fname = f"{label}_{power}uW.png"
         cv2.imwrite(os.path.join(out_dir, fname), crop)
@@ -512,7 +542,8 @@ def process_array(array_dir, template, labels, n_cols, label_index, out_root):
     if col_shift > 0:   parts.append(f"left {col_shift} col(s)")
     elif col_shift < 0: parts.append(f"right {-col_shift} col(s)")
     shift_note = f"  [shifted grid {', '.join(parts)}]" if parts else ""
-    print(f"  {name}: {len(rows_written)}/{len(powers)} measured LEDs cropped{extra}{shift_note}")
+    print(f"  {name}: {len(rows_written)}/{len(powers)} measured LEDs cropped "
+          f"@ {crop_size}px (pitch {led_pitch(aligned):.0f}px){extra}{shift_note}")
     return rows_written
 
 
@@ -522,7 +553,8 @@ def main():
     label_index = build_label_index(n_rows, n_cols)
     print(f"Template: {n_cols} x {n_rows} = {len(template)} dots")
     print(f"Labelling crops at I_Low={I_LOW_TARGET}mA, VDD={VDD_TARGET}V  |  "
-          f"crop {CROP_SIZE}px  |  {'colour' if SAVE_COLOR else 'blue-channel'}\n")
+          f"crop {CROP_FRACTION:.0%} of LED pitch  |  "
+          f"{'colour' if SAVE_COLOR else 'blue-channel'}\n")
 
     array_dirs = [d for d in sorted(glob.glob(os.path.join(TRAINING_DIR, "*")))
                   if os.path.isdir(d)]
